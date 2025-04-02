@@ -1,32 +1,26 @@
 require("dotenv").config();
 const fs = require("fs");
-const { Cookie, CookieJar } = require("tough-cookie");
-const { CloudClient } = require("cloud189-sdk");
+const { CloudClient, FileTokenStore } = require("cloud189-sdk");
 const recording = require("log4js/lib/appenders/recording");
 const accounts = require("../accounts");
 const families = require("../families");
-const {
-  mask,
-  formatDateISO,
-  deleteNonTargetDirectories,
-  delay,
-  groupByNum,
-} = require("./utils");
+const { mask, delay } = require("./utils");
 const push = require("./push");
 const { log4js, cleanLogs, catLogs } = require("./logger");
 const execThreshold = process.env.EXEC_THRESHOLD || 1;
-// 缓存cookie
-const cacheCookie = !process.env.GITHUB_ACTIONS && process.env.CACHE_COOKIE === "true";
+const tokenDir = ".token";
 
 // 个人任务签到
 const doUserTask = async (cloudClient, logger) => {
   const tasks = Array.from({ length: execThreshold }, () =>
     cloudClient.userSign()
   );
-  const result = (await Promise.all(tasks)).filter((res) => !res.isSign);
+  const result = (await Promise.allSettled(tasks)).filter(
+    ({ status, value }) => status === "fulfilled" && !value.isSign
+  );
   logger.info(
     `个人签到任务: 成功数/总请求数 ${result.length}/${tasks.length} 获得 ${
-      result.map((res) => res.netdiskBonus)?.join(",") || "0"
+      result.map(({ value }) => value.netdiskBonus)?.join(",") || "0"
     }M 空间`
   );
 };
@@ -54,74 +48,28 @@ const doFamilyTask = async (cloudClient, logger) => {
       familyId = familyInfoResp[0].familyId;
     }
     logger.info(`执行家庭签到ID:${familyId}`);
-    const tasks = Array.from({ length: execThreshold }, () =>
-      cloudClient.familyUserSign(familyId)
+    const tasks = [ cloudClient.familyUserSign(familyId) ]
+    const result = (await Promise.allSettled(tasks)).filter(
+      ({ status, value }) => status === "fulfilled" && !value.signStatus
     );
-    const result = (await Promise.all(tasks)).filter((res) => !res.signStatus);
     return logger.info(
-      `家庭签到任务: 成功数/总请求数 ${result.length}/${tasks.length} 获得 ${
-        result.map((res) => res.bonusSpace)?.join(",") || "0"
+      `家庭签到任务: 获得 ${
+        result.map(({ value }) => value.bonusSpace)?.join(",") || "0"
       }M 空间`
     );
   }
-};
-
-const cookieDir = `.cookie/${formatDateISO(new Date())}`;
-
-const saveCookies = async (userName, cookieJar) => {
-  deleteNonTargetDirectories(".cookie", formatDateISO(new Date()));
-  const cookiePath = `${cookieDir}`;
-  if (!fs.existsSync(cookiePath)) {
-    fs.mkdirSync(cookiePath, { recursive: true });
-  }
-  const cookies = cookieJar
-    .getCookiesSync("https://cloud.189.cn")
-    .map((cookie) => cookie.toString());
-  fs.writeFileSync(`${cookiePath}/${userName}.json`, JSON.stringify(cookies), {
-    encoding: "utf-8",
-  });
-};
-
-const loadCookies = async (userName) => {
-  const ipIpAddr = await getIpAddr();
-  if (!ipIpAddr) {
-    return null;
-  }
-  const cookiePath = `${cookieDir}/${ipIpAddr}`;
-  if (fs.existsSync(`${cookiePath}/${userName}.json`)) {
-    const cookies = JSON.parse(
-      fs.readFileSync(`${cookiePath}/${userName}.json`, { encoding: "utf8" })
-    );
-    const cookieJar = new CookieJar();
-    cookies.forEach((cookie) => {
-      const cookieObj = Cookie.parse(cookie)
-      if(cookieObj.key === 'COOKIE_LOGIN_USER') {
-        console.log(cookieObj)
-        cookieJar.setCookieSync(cookieObj, "https://cloud.189.cn");
-      }
-    });
-    return cookieJar;
-  }
-  return null;
 };
 
 const run = async (userName, password, userSizeInfoMap, logger) => {
   if (userName && password) {
     const before = Date.now();
     try {
-      logger.log('开始执行');
-      const cloudClient = new CloudClient(userName, password);
-      if (cacheCookie) {
-        const cookies = await loadCookies(userName);
-        if (cookies) {
-          cloudClient.cookieJar = cookies;
-        } else {
-          await cloudClient.login();
-          await saveCookies(userName, cloudClient.cookieJar);
-        }
-      } else {
-        await cloudClient.login();
-      }
+      logger.log("开始执行");
+      const cloudClient = new CloudClient({
+        username: userName,
+        password,
+        token: new FileTokenStore(`${tokenDir}/${userName}.json`),
+      });
       const beforeUserSizeInfo = await cloudClient.getUserSizeInfo();
       userSizeInfoMap.set(userName, {
         cloudClient,
@@ -152,37 +100,49 @@ const run = async (userName, password, userSizeInfoMap, logger) => {
 
 // 开始执行程序
 async function main() {
+  if (!fs.existsSync(tokenDir)) {
+    fs.mkdirSync(tokenDir);
+  }
   //  用于统计实际容量变化
   const userSizeInfoMap = new Map();
-  //  分批执行
-  const groupMaxNum = 5;
-  const runTaskGroups = groupByNum(accounts, groupMaxNum);
-  for (let index = 0; index < runTaskGroups.length; index++) {
-    const taskGroup = runTaskGroups[index];
-    await Promise.all(taskGroup.map((account) => {
-      const { userName, password } = account;
-      const userNameInfo = mask(userName, 3, 7);
-      const logger = log4js.getLogger(userName);
-      logger.addContext("user", userNameInfo);
-      return run(userName, password, userSizeInfoMap, logger);
-    }));
+  for (let index = 0; index < accounts.length; index++) {
+    const account = accounts[index];
+    const { userName, password } = account;
+    const userNameInfo = mask(userName, 3, 7);
+    const logger = log4js.getLogger(userName);
+    logger.addContext("user", userNameInfo);
+    await run(userName, password, userSizeInfoMap, logger);
   }
 
   //数据汇总
-  for (const [userName, { cloudClient, userSizeInfo, logger } ] of userSizeInfoMap) {
+  for (const [
+    userName,
+    { cloudClient, userSizeInfo, logger },
+  ] of userSizeInfoMap) {
     const afterUserSizeInfo = await cloudClient.getUserSizeInfo();
     logger.log(
-      `个人总容量增加：${(
+      `个人容量：⬆️  ${(
         (afterUserSizeInfo.cloudCapacityInfo.totalSize -
           userSizeInfo.cloudCapacityInfo.totalSize) /
         1024 /
         1024
-      ).toFixed(2)}M,家庭容量增加：${(
+      ).toFixed(2)}M/${(
+        afterUserSizeInfo.cloudCapacityInfo.totalSize /
+        1024 /
+        1024 /
+        1024
+      ).toFixed(2)}G`,
+      `家庭容量：⬆️  ${(
         (afterUserSizeInfo.familyCapacityInfo.totalSize -
           userSizeInfo.familyCapacityInfo.totalSize) /
         1024 /
         1024
-      ).toFixed(2)}M`
+      ).toFixed(2)}M/${(
+        afterUserSizeInfo.familyCapacityInfo.totalSize /
+        1024 /
+        1024 /
+        1024
+      ).toFixed(2)}G`
     );
   }
 }

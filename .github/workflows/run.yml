@@ -7,12 +7,15 @@ on:
     types: started
   workflow_dispatch:
   schedule:
-    - cron: 35 3 * * *
+    - cron: 35 2 * * *
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     environment: user
     steps:
+      - name: 🔀 random delay 0-300 seconds
+        run: sleep $((RANDOM % 301))
+
       - name: 🔌 Check out code
         uses: actions/checkout@main
 
@@ -22,20 +25,19 @@ jobs:
           node-version: 18
           cache: npm
 
-      - name: 🗳️ Check if CACHE_COOKIE is true
-        if: vars.CACHE_COOKIE == 'true'
+      - name: 👾 Check if Debug is true
+        if: vars.debug == '1'
         run: |
-          echo "CACHE_COOKIE=true" >> $GITHUB_ENV
-          echo "CURRENT_DATE=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+          echo "CLOUD189_VERBOSE=1" >> $GITHUB_ENV
       
       - name: 📹 Restore cached Cookie
         id: cache-cookie-restore
-        if: vars.CACHE_COOKIE == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
-          path: .cookie
-          key: ${{ env.CURRENT_DATE }}-cookie
-    
+          path: .token
+          key: ${{ runner.os }}-cache-token
+          restore-keys: ${{ runner.os }}-cache-token-
+
       - name: 🔧 Init secrets
         uses: shine1594/secrets-to-env-action@master
         with:
@@ -53,6 +55,12 @@ jobs:
           timeout_minutes: 30
           max_attempts: 3
           command: npm start
+      
+      - name: 📹 Save cached Cookie
+        uses: actions/cache/save@v4
+        with:
+          path: .token
+          key: ${{ runner.os }}-cache-token-${{ hashFiles('.token/*.json') }}
 
       - name: 🚗 Keep Running
         if: github.event_name == 'schedule'
